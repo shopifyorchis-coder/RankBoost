@@ -10,7 +10,16 @@ const __dirname = path.dirname(__filename)
 const app = express()
 const { Pool } = pg
 
-const port = process.env.PORT || 8080;
+// const port = process.env.PORT || 8080;
+const port = process.env.PORT;
+
+if (!port) {
+  throw new Error("PORT is not defined. Railway will not work.");
+}
+
+app.listen(port, "0.0.0.0", () => {
+  console.log("SERVER RUNNING ON PORT:", port);
+});
 const distPath = path.join(__dirname, 'dist')
 const indexHtmlPath = path.join(distPath, 'index.html')
 const databaseUrl = process.env.DATABASE_URL || ''
