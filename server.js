@@ -10,7 +10,7 @@ const __dirname = path.dirname(__filename)
 const app = express()
 const { Pool } = pg
 
-const port = Number(process.env.PORT) || 3000
+const port = process.env.PORT || 8080;
 const distPath = path.join(__dirname, 'dist')
 const indexHtmlPath = path.join(distPath, 'index.html')
 const databaseUrl = process.env.DATABASE_URL || ''
