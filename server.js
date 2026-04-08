@@ -3,14 +3,27 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import express from 'express'
+import pg from 'pg'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const app = express()
+const { Pool } = pg
 
 const port = Number(process.env.PORT) || 3000
 const distPath = path.join(__dirname, 'dist')
 const indexHtmlPath = path.join(distPath, 'index.html')
+const databaseUrl = process.env.DATABASE_URL || ''
+const db = databaseUrl
+  ? new Pool({
+      connectionString: databaseUrl,
+      ssl: databaseUrl.includes('localhost')
+        ? false
+        : {
+            rejectUnauthorized: false,
+          },
+    })
+  : null
 
 const requiredEnvVars = [
   'APP_URL',
@@ -158,6 +171,70 @@ function renderAppHtml() {
   return html.replace('</head>', `${injectedTags}</head>`)
 }
 
+async function ensureDatabase() {
+  if (!db) {
+    console.warn(
+      'DATABASE_URL is not set. Shopify tokens will only persist in memory until the server restarts.',
+    )
+    return
+  }
+
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS shopify_offline_tokens (
+      shop TEXT PRIMARY KEY,
+      access_token TEXT NOT NULL,
+      scope TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `)
+}
+
+async function saveOfflineToken(shop, accessToken, scope) {
+  if (!db) {
+    offlineTokens.set(shop, accessToken)
+    return
+  }
+
+  await db.query(
+    `
+      INSERT INTO shopify_offline_tokens (shop, access_token, scope, created_at, updated_at)
+      VALUES ($1, $2, $3, NOW(), NOW())
+      ON CONFLICT (shop)
+      DO UPDATE SET
+        access_token = EXCLUDED.access_token,
+        scope = EXCLUDED.scope,
+        updated_at = NOW()
+    `,
+    [shop, accessToken, scope || null],
+  )
+
+  offlineTokens.set(shop, accessToken)
+}
+
+async function getOfflineToken(shop) {
+  if (offlineTokens.has(shop)) {
+    return offlineTokens.get(shop)
+  }
+
+  if (!db) {
+    return null
+  }
+
+  const result = await db.query(
+    'SELECT access_token FROM shopify_offline_tokens WHERE shop = $1 LIMIT 1',
+    [shop],
+  )
+
+  const token = result.rows[0]?.access_token || null
+
+  if (token) {
+    offlineTokens.set(shop, token)
+  }
+
+  return token
+}
+
 async function exchangeCodeForAccessToken(shop, code) {
   const response = await fetch(`https://${shop}/admin/oauth/access_token`, {
     method: 'POST',
@@ -186,7 +263,7 @@ app.get('/healthz', (_req, res) => {
   res.json({ ok: true })
 })
 
-app.get('/api/shopify/status', (req, res) => {
+app.get('/api/shopify/status', async (req, res) => {
   const shop = req.query.shop
 
   if (!isValidShop(shop)) {
@@ -196,10 +273,20 @@ app.get('/api/shopify/status', (req, res) => {
     })
   }
 
-  return res.json({
-    connected: offlineTokens.has(shop),
-    shop,
-  })
+  try {
+    const token = await getOfflineToken(shop)
+
+    return res.json({
+      connected: Boolean(token),
+      shop,
+    })
+  } catch (error) {
+    console.error(error)
+    return res.status(500).json({
+      connected: false,
+      error: 'Unable to read Shopify connection status.',
+    })
+  }
 })
 
 app.get('/auth', (req, res) => {
@@ -258,8 +345,7 @@ app.get('/auth/callback', async (req, res) => {
 
   try {
     const tokenResponse = await exchangeCodeForAccessToken(shop, code)
-
-    offlineTokens.set(shop, tokenResponse.access_token)
+    await saveOfflineToken(shop, tokenResponse.access_token, tokenResponse.scope)
 
     const redirectUrl = new URL(normalizeAppUrl() || `http://localhost:${port}`)
     redirectUrl.searchParams.set('shop', shop)
@@ -288,24 +374,35 @@ app.use((req, res, next) => {
 
 app.use(express.static(distPath))
 
-app.get(/.*/, (req, res) => {
+app.get(/.*/, async (req, res) => {
   const shop = typeof req.query.shop === 'string' ? req.query.shop : ''
   const host = typeof req.query.host === 'string' ? req.query.host : ''
 
-  if (isValidShop(shop) && !offlineTokens.has(shop)) {
-    const authUrl = new URL('/auth', normalizeAppUrl() || `http://localhost:${port}`)
-    authUrl.searchParams.set('shop', shop)
+  if (isValidShop(shop)) {
+    const token = await getOfflineToken(shop)
 
-    if (host) {
-      authUrl.searchParams.set('host', host)
+    if (!token) {
+      const authUrl = new URL('/auth', normalizeAppUrl() || `http://localhost:${port}`)
+      authUrl.searchParams.set('shop', shop)
+
+      if (host) {
+        authUrl.searchParams.set('host', host)
+      }
+
+      return res.status(200).send(buildEmbeddedAuthPage(authUrl.toString()))
     }
-
-    return res.status(200).send(buildEmbeddedAuthPage(authUrl.toString()))
   }
 
   return res.type('html').send(renderAppHtml())
 })
 
-app.listen(port, '0.0.0.0', () => {
-  console.log(`RankBoost server running on port ${port}`)
-})
+ensureDatabase()
+  .then(() => {
+    app.listen(port, '0.0.0.0', () => {
+      console.log(`RankBoost server running on port ${port}`)
+    })
+  })
+  .catch((error) => {
+    console.error('Failed to initialize database connection.', error)
+    process.exit(1)
+  })
